@@ -42,7 +42,7 @@ AUTO_UPDATE_SELL_ON_ALERT = (os.getenv("AUTO_UPDATE_SELL_ON_ALERT") or "1").stri
 
 DB_PATH = os.getenv("DB_PATH", "watchlist.db").strip()
 
-# USD conversion (fixed for your requirement)
+# USD conversion (fixed per your requirement)
 SAR_PER_USD = 3.70  # 1$ = 3.70 SAR
 
 # Optional: blok bo‘lsa proxy scraper (ixtiyoriy)
@@ -56,7 +56,7 @@ UA = os.getenv(
 
 
 # ======================
-# DB
+# DB (create)
 # ======================
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -67,9 +67,9 @@ def db() -> sqlite3.Connection:
             url TEXT NOT NULL UNIQUE,
             title TEXT,
             currency TEXT,
-            target_price REAL NOT NULL,    -- signal/trigger narx
-            sell_price REAL,               -- kanalga qo‘yiladigan narx
-            category TEXT,                 -- VITAMIN/OMEGA/...
+            target_price REAL NOT NULL,
+            sell_price REAL,
+            category TEXT,
             last_price REAL,
             last_seen_ts INTEGER,
             last_alert_price REAL,
@@ -82,20 +82,45 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+# ======================
+# DB migrate (safe)
+# ======================
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
 def migrate_db():
     conn = sqlite3.connect(DB_PATH)
+
+    # ✅ IMPORTANT: if table doesn't exist, don't ALTER (prevents crash)
+    if not table_exists(conn, "items"):
+        conn.close()
+        return
+
     cols = {c[1] for c in conn.execute("PRAGMA table_info(items)").fetchall()}
-    # Add missing columns if upgrading old DB
+
+    def add_col(sql: str):
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass
+
     if "sell_price" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN sell_price REAL")
+        add_col("ALTER TABLE items ADD COLUMN sell_price REAL")
     if "category" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN category TEXT")
-    if "image_url" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN image_url TEXT")
-    if "last_alert_price" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN last_alert_price REAL")
+        add_col("ALTER TABLE items ADD COLUMN category TEXT")
+    if "last_price" not in cols:
+        add_col("ALTER TABLE items ADD COLUMN last_price REAL")
     if "last_seen_ts" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN last_seen_ts INTEGER")
+        add_col("ALTER TABLE items ADD COLUMN last_seen_ts INTEGER")
+    if "last_alert_price" not in cols:
+        add_col("ALTER TABLE items ADD COLUMN last_alert_price REAL")
+    if "image_url" not in cols:
+        add_col("ALTER TABLE items ADD COLUMN image_url TEXT")
+
     conn.commit()
     conn.close()
 
@@ -165,10 +190,6 @@ def extract_json_ld(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return out
 
 def find_product_offer(data: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
-    """
-    Returns (price, currency, title, image_url)
-    Tries schema.org Product -> offers
-    """
     title = None
     image_url = None
     for k in ("name", "headline", "title"):
@@ -207,7 +228,6 @@ def find_product_offer(data: Dict[str, Any]) -> Tuple[Optional[float], Optional[
 def parse_page(html: str) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
     soup = BeautifulSoup(html, "html.parser")
 
-    # JSON-LD
     for obj in extract_json_ld(soup):
         p, cur, title, img = find_product_offer(obj)
         if p is not None:
@@ -219,7 +239,6 @@ def parse_page(html: str) -> Tuple[Optional[float], Optional[str], Optional[str]
                     img = ogi["content"]
             return p, cur, title, img
 
-    # meta product price
     meta_price = soup.find("meta", {"property": "product:price:amount"}) or soup.find("meta", {"name": "product:price:amount"})
     if meta_price and meta_price.get("content"):
         p = clean_price(meta_price["content"])
@@ -235,7 +254,6 @@ def parse_page(html: str) -> Tuple[Optional[float], Optional[str], Optional[str]
         img = ogi["content"] if ogi and ogi.get("content") else None
         return p, cur, title, img
 
-    # rough SAR match
     text = soup.get_text(" ", strip=True)
     m = re.search(r"(SAR|ر\.س)\s*([0-9]+(?:[.,][0-9]+)?)", text)
     p = clean_price(m.group(2)) if m else None
@@ -475,8 +493,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Sell: {fmt_money(sell_price)} SAR\n"
         f"Hozir: {fmt_money(p)} SAR\n"
         f"Rasm: {'bor' if img else 'yo‘q'}\n"
-        f"URL: {url}\n\n"
-        f"🛠 Boshqarish: /item (ID ro‘yxatdan)",
+        f"URL: {url}",
         disable_web_page_preview=True,
     )
 
@@ -518,7 +535,7 @@ async def cmd_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Sell: <b>{fmt_money(sp)} SAR</b>\n"
         f"Rasm: {'bor' if img else 'yo‘q'}\n"
         f"🔗 {url}\n\n"
-        f"♻️ Recalc formula: sell = last * {SELL_MARKUP} + {SELL_ADD} (round {SELL_ROUND})"
+        f"♻️ Recalc: sell = last * {SELL_MARKUP} + {SELL_ADD} (round {SELL_ROUND})"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=panel_keyboard(iid), disable_web_page_preview=True)
 
@@ -684,7 +701,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_item_to_channel(app: Application, item_id: int, forced: bool, notify_admin_chat: Optional[int] = None):
     conn = db()
     row = conn.execute(
-        "SELECT id,title,currency,target_price,sell_price,category,last_price,url,image_url,last_alert_price FROM items WHERE id=?",
+        "SELECT id,title,currency,target_price,sell_price,category,last_price,url,image_url FROM items WHERE id=?",
         (item_id,),
     ).fetchone()
     conn.close()
@@ -693,14 +710,13 @@ async def post_item_to_channel(app: Application, item_id: int, forced: bool, not
             await app.bot.send_message(chat_id=notify_admin_chat, text="Topilmadi.")
         return
 
-    _, title, cur, tp, sp, cat, lp, url, img, _ = row
+    _, title, cur, tp, sp, cat, lp, url, img = row
 
     if not forced and lp is not None:
         pct = discount_pct(tp, lp)
         if not (lp <= tp or pct >= MIN_DISCOUNT_PCT):
             return
 
-    # For manual post, prev_price unknown -> use last_price as prev (best effort)
     await send_deal_message(
         app=app,
         chat_id=CHANNEL_ID,
@@ -752,7 +768,6 @@ async def run_check(app: Application, only_item_id: Optional[int], manual_chat_i
                 if sp is None:
                     sp = calc_sell_price(now_price)
 
-            # update db
             conn2 = db()
             conn2.execute(
                 "UPDATE items SET title=?, currency=?, last_price=?, last_seen_ts=?, image_url=?, sell_price=? WHERE id=?",
@@ -768,7 +783,6 @@ async def run_check(app: Application, only_item_id: Optional[int], manual_chat_i
             should_alert = (now_price <= tp) or (pct >= MIN_DISCOUNT_PCT)
 
             if should_alert and (last_alert_price is None or abs(last_alert_price - now_price) > 0.01):
-                # DM admin
                 if ADMIN_ID:
                     await send_deal_message(
                         app=app,
@@ -785,7 +799,6 @@ async def run_check(app: Application, only_item_id: Optional[int], manual_chat_i
                     )
                     await app.bot.send_message(chat_id=ADMIN_ID, text=f"🛠 Boshqarish: /item {iid}")
 
-                # auto post to channel (optional)
                 if AUTO_POST_TO_CHANNEL and CHANNEL_ID:
                     await send_deal_message(
                         app=app,
@@ -801,7 +814,6 @@ async def run_check(app: Application, only_item_id: Optional[int], manual_chat_i
                         image_url=stored_img,
                     )
 
-                # store last_alert_price
                 conn3 = db()
                 conn3.execute("UPDATE items SET last_alert_price=? WHERE id=?", (now_price, iid))
                 conn3.commit()
@@ -824,9 +836,13 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN yo‘q")
 
-    migrate_db()
+    # ✅ IMPORTANT ORDER:
+    # 1) create table
     c = db()
     c.close()
+
+    # 2) migrate (safe)
+    migrate_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -840,10 +856,9 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # scheduler
     app.job_queue.run_once(lambda *_: asyncio.create_task(scheduler(app)), when=1)
 
-    print("✅ Deal Watcher Admin Bot (FULL) running…")
+    print("✅ Deal Watcher Admin Bot running…")
     app.run_polling(drop_pending_updates=True)
 
 
