@@ -3,13 +3,10 @@ import re
 import json
 import time
 import asyncio
-from typing import Optional, Tuple, Dict, Any, List, Union
+from typing import Optional, Tuple, Dict, Any, List
 
 import aiohttp
 from bs4 import BeautifulSoup
-
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -22,23 +19,34 @@ from telegram.ext import (
     filters,
 )
 
+# DB backends
+USE_POSTGRES = False
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    USE_POSTGRES = True
+except Exception:
+    USE_POSTGRES = False
+
+import sqlite3
+
 # ======================
 # ENV
 # ======================
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 ADMIN_ID = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
-CHANNEL_ID_RAW = (os.getenv("CHANNEL_ID") or "").strip()
+CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()
 
 CHECK_EVERY_SEC = int(os.getenv("CHECK_EVERY_SEC") or "900")          # 15 min
 MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT") or "25")
 AUTO_POST_TO_CHANNEL = (os.getenv("AUTO_POST_TO_CHANNEL") or "0").strip() == "1"
 
-SELL_MARKUP = float(os.getenv("SELL_MARKUP") or "1.35")              # +35%
-SELL_ADD = float(os.getenv("SELL_ADD") or "0")                       # SAR
+SELL_MARKUP = float(os.getenv("SELL_MARKUP") or "1.35")               # +35%
+SELL_ADD = float(os.getenv("SELL_ADD") or "0")                        # SAR
 SELL_ROUND = float(os.getenv("SELL_ROUND") or "1")
 AUTO_UPDATE_SELL_ON_ALERT = (os.getenv("AUTO_UPDATE_SELL_ON_ALERT") or "1").strip() == "1"
 
-SAR_PER_USD = float(os.getenv("SAR_PER_USD") or "3.70")              # 1$=3.70 SAR
+SAR_PER_USD = float(os.getenv("SAR_PER_USD") or "3.70")               # 1$=3.70 SAR
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
@@ -50,61 +58,96 @@ UA = os.getenv(
     "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Mobile Safari/537.36",
 ).strip()
 
+SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/watchlist.db").strip()
 
-def parse_chat_id(v: str) -> Optional[Union[int, str]]:
-    """
-    CHANNEL_ID:
-      - "-100123..." bo‘lsa int qilib olamiz
-      - "@channelusername" bo‘lsa string qoldiramiz
-      - bo‘sh bo‘lsa None
-    """
-    v = (v or "").strip()
-    if not v:
-        return None
-    if re.fullmatch(r"-?\d+", v):
-        try:
-            return int(v)
-        except:
-            return v
-    return v
-
-
-CHANNEL_ID = parse_chat_id(CHANNEL_ID_RAW)
 
 # ======================
-# DB (PostgreSQL)
+# DB (AUTO: Postgres if DATABASE_URL valid, else SQLite)
 # ======================
-def db():
+def using_postgres() -> bool:
+    if not USE_POSTGRES:
+        return False
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL yo‘q. Railway’da PostgreSQL qo‘shing va Chegirma servisiga DATABASE_URL reference qiling.")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        return False
+    # Must look like a URL
+    return DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
 
+def db_kind() -> str:
+    return "postgres" if using_postgres() else "sqlite"
 
 def init_db():
-    conn = db()
-    try:
-        with conn.cursor() as cur:
+    if using_postgres():
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS items (
+                        id SERIAL PRIMARY KEY,
+                        url TEXT UNIQUE NOT NULL,
+                        title TEXT,
+                        currency TEXT,
+                        target_price DOUBLE PRECISION NOT NULL,
+                        sell_price DOUBLE PRECISION,
+                        category TEXT,
+                        last_price DOUBLE PRECISION,
+                        last_seen_ts BIGINT,
+                        last_alert_price DOUBLE PRECISION,
+                        image_url TEXT,
+                        created_ts BIGINT NOT NULL
+                    );
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(SQLITE_PATH)
+        try:
+            cur = conn.cursor()
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS items (
-                    id SERIAL PRIMARY KEY,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     url TEXT UNIQUE NOT NULL,
                     title TEXT,
                     currency TEXT,
-                    target_price DOUBLE PRECISION NOT NULL,
-                    sell_price DOUBLE PRECISION,
+                    target_price REAL NOT NULL,
+                    sell_price REAL,
                     category TEXT,
-                    last_price DOUBLE PRECISION,
-                    last_seen_ts BIGINT,
-                    last_alert_price DOUBLE PRECISION,
+                    last_price REAL,
+                    last_seen_ts INTEGER,
+                    last_alert_price REAL,
                     image_url TEXT,
-                    created_ts BIGINT NOT NULL
+                    created_ts INTEGER NOT NULL
                 );
                 """
             )
-        conn.commit()
-    finally:
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
+
+def pg_fetchone(cur):
+    row = cur.fetchone()
+    return row
+
+def sqlite_row_to_dict(cur, row):
+    if row is None:
+        return None
+    cols = [d[0] for d in cur.description]
+    return {cols[i]: row[i] for i in range(len(cols))}
+
+def sqlite_fetchone(cur):
+    row = cur.fetchone()
+    return sqlite_row_to_dict(cur, row)
+
+def sqlite_fetchall(cur):
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description]
+    out = []
+    for r in rows:
+        out.append({cols[i]: r[i] for i in range(len(cols))})
+    return out
 
 
 # ======================
@@ -114,13 +157,11 @@ def is_admin(update: Update) -> bool:
     u = update.effective_user
     return bool(u and (ADMIN_ID == 0 or u.id == ADMIN_ID))
 
-
 def fmt_money(x: Optional[float]) -> str:
     if x is None:
         return "—"
     s = f"{x:.2f}".rstrip("0").rstrip(".")
     return s
-
 
 def clean_price(s: str) -> Optional[float]:
     if not s:
@@ -135,25 +176,21 @@ def clean_price(s: str) -> Optional[float]:
     except:
         return None
 
-
-def discount_pct(base: Optional[float], now: Optional[float]) -> float:
-    if base is None or now is None or base <= 0:
+def discount_pct(base: float, now: float) -> float:
+    if base <= 0:
         return 0.0
     return max(0.0, (base - now) / base * 100.0)
-
 
 def round_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return round(x / step) * step
 
-
 def calc_sell_price(last_price: Optional[float]) -> Optional[float]:
     if last_price is None:
         return None
     raw = last_price * SELL_MARKUP + SELL_ADD
     return round_to_step(raw, SELL_ROUND)
-
 
 def sar_to_usd(sar: Optional[float]) -> Optional[float]:
     if sar is None:
@@ -176,7 +213,6 @@ def extract_json_ld(soup: BeautifulSoup) -> List[Dict[str, Any]]:
         except:
             continue
     return out
-
 
 def find_product_offer(data: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
     title = None
@@ -214,7 +250,6 @@ def find_product_offer(data: Dict[str, Any]) -> Tuple[Optional[float], Optional[
                     break
 
     return price, currency, title, image_url
-
 
 def parse_page(html: str) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
     soup = BeautifulSoup(html, "html.parser")
@@ -288,12 +323,13 @@ def build_caption(
     sell_price: Optional[float],
     category: Optional[str],
 ) -> str:
-    pct = discount_pct(prev_price, last_price)
+    now = last_price
+    pct = discount_pct(target_price, now) if (now is not None) else 0.0
 
     cat_line = f"🏷 Kategoriya: <b>{category}</b>\n" if category else ""
 
     prev_usd = sar_to_usd(prev_price)
-    now_usd = sar_to_usd(last_price)
+    now_usd = sar_to_usd(now)
     target_usd = sar_to_usd(target_price)
     sell_usd = sar_to_usd(sell_price)
 
@@ -309,7 +345,7 @@ def build_caption(
         f"{cat_line}"
         f"📌 Avvalgi narxi: <b>{fmt_money(prev_price)} SAR</b>\n"
         f"   (${fmt_money(prev_usd)})\n"
-        f"✅ Hozirgi narxi: <b>{fmt_money(last_price)} SAR</b>\n"
+        f"✅ Hozirgi narxi: <b>{fmt_money(now)} SAR</b>\n"
         f"   (${fmt_money(now_usd)})\n"
         f"🎯 Trigger narx: <b>{fmt_money(target_price)} SAR</b>\n"
         f"   (${fmt_money(target_usd)})\n"
@@ -320,10 +356,8 @@ def build_caption(
         f"📩 Buyurtma uchun DM"
     ).strip()
 
-
 def deal_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Ko‘rish / Buyurtma", url=url)]])
-
 
 def home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -342,7 +376,6 @@ def home_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
-
 
 def panel_keyboard(item_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -368,7 +401,7 @@ def panel_keyboard(item_id: int) -> InlineKeyboardMarkup:
 # ======================
 async def send_deal_message(
     app: Application,
-    chat_id: Union[str, int],
+    chat_id: str | int,
     title: str,
     url: str,
     currency: str,
@@ -391,7 +424,7 @@ async def send_deal_message(
     )
     kb = deal_keyboard(url)
 
-    if image_url and isinstance(image_url, str) and image_url.startswith("http"):
+    if image_url and image_url.startswith("http"):
         try:
             await app.bot.send_photo(
                 chat_id=chat_id,
@@ -421,13 +454,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Kechirasiz, bu bot xususiy (private).")
         return
     await update.message.reply_text(
-        "✅ Deal Watcher + Admin Panel (PostgreSQL) tayyor.\n\n"
+        f"✅ Deal Watcher + Admin Panel ({db_kind().upper()}) tayyor.\n\n"
         "Buyruqlar:\n"
         "• /add <url> <trigger_price> [sell_price] [category]\n"
         "• /panel\n"
         "• /item <id>\n"
-        "• /list\n"
-        "• /checkall\n\n"
+        "• /checkall\n"
+        "• /list\n\n"
         "Misol:\n"
         "/add https://sa.iherb.com/... 120 160 VITAMIN\n"
         "Yoki:\n"
@@ -436,12 +469,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
         return
     await update.message.reply_text("🧩 Admin panel:", reply_markup=home_keyboard())
-
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
@@ -483,31 +514,60 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sell_price = calc_sell_price(p)
 
     now_ts = int(time.time())
-    conn = db()
-    try:
-        with conn.cursor() as c:
-            c.execute(
+
+    if using_postgres():
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as c:
+                c.execute(
+                    """
+                    INSERT INTO items (url, title, currency, target_price, sell_price, category, last_price, last_seen_ts, last_alert_price, image_url, created_ts)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (url) DO UPDATE SET
+                        title=EXCLUDED.title,
+                        currency=EXCLUDED.currency,
+                        target_price=EXCLUDED.target_price,
+                        sell_price=EXCLUDED.sell_price,
+                        category=EXCLUDED.category,
+                        last_price=EXCLUDED.last_price,
+                        last_seen_ts=EXCLUDED.last_seen_ts,
+                        image_url=EXCLUDED.image_url
+                    RETURNING id;
+                    """,
+                    (url, title, cur or "SAR", trigger_price, sell_price, category, p, now_ts, None, img, now_ts),
+                )
+                row = pg_fetchone(c)
+                item_id = row["id"] if row else None
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(SQLITE_PATH)
+        try:
+            cur2 = conn.cursor()
+            cur2.execute(
                 """
                 INSERT INTO items (url, title, currency, target_price, sell_price, category, last_price, last_seen_ts, last_alert_price, image_url, created_ts)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (url) DO UPDATE SET
-                    title=EXCLUDED.title,
-                    currency=EXCLUDED.currency,
-                    target_price=EXCLUDED.target_price,
-                    sell_price=EXCLUDED.sell_price,
-                    category=EXCLUDED.category,
-                    last_price=EXCLUDED.last_price,
-                    last_seen_ts=EXCLUDED.last_seen_ts,
-                    image_url=EXCLUDED.image_url
-                RETURNING id;
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(url) DO UPDATE SET
+                    title=excluded.title,
+                    currency=excluded.currency,
+                    target_price=excluded.target_price,
+                    sell_price=excluded.sell_price,
+                    category=excluded.category,
+                    last_price=excluded.last_price,
+                    last_seen_ts=excluded.last_seen_ts,
+                    image_url=excluded.image_url
                 """,
                 (url, title, cur or "SAR", trigger_price, sell_price, category, p, now_ts, None, img, now_ts),
             )
-            row = c.fetchone()
+            # fetch id
+            cur2.execute("SELECT id FROM items WHERE url=?", (url,))
+            row = sqlite_fetchone(cur2)
             item_id = row["id"] if row else None
-        conn.commit()
-    finally:
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
 
     await update.message.reply_text(
         f"✅ Qo‘shildi.\n"
@@ -522,14 +582,12 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-
 async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
         return
     await update.message.reply_text("🔎 Hammasini tekshiryapman…")
     await run_check(context.application, only_item_id=None, manual_chat_id=update.effective_chat.id)
     await update.message.reply_text("✅ Tekshiruv tugadi.")
-
 
 async def cmd_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
@@ -543,16 +601,28 @@ async def cmd_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("id raqam bo‘lsin.")
         return
 
-    conn = db()
-    try:
-        with conn.cursor() as c:
-            c.execute(
-                "SELECT id,title,currency,target_price,sell_price,category,last_price,url,image_url FROM items WHERE id=%s",
+    if using_postgres():
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as c:
+                c.execute(
+                    "SELECT id,title,currency,target_price,sell_price,category,last_price,url,image_url FROM items WHERE id=%s",
+                    (iid,),
+                )
+                row = pg_fetchone(c)
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(SQLITE_PATH)
+        try:
+            cur2 = conn.cursor()
+            cur2.execute(
+                "SELECT id,title,currency,target_price,sell_price,category,last_price,url,image_url FROM items WHERE id=?",
                 (iid,),
             )
-            row = c.fetchone()
-    finally:
-        conn.close()
+            row = sqlite_fetchone(cur2)
+        finally:
+            conn.close()
 
     if not row:
         await update.message.reply_text("Topilmadi.")
@@ -575,20 +645,30 @@ async def cmd_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
         return
 
-    conn = db()
-    try:
-        with conn.cursor() as c:
-            c.execute(
+    if using_postgres():
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as c:
+                c.execute(
+                    "SELECT id,title,currency,target_price,sell_price,last_price,category,url FROM items ORDER BY id DESC LIMIT 50"
+                )
+                rows = c.fetchall()
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(SQLITE_PATH)
+        try:
+            cur2 = conn.cursor()
+            cur2.execute(
                 "SELECT id,title,currency,target_price,sell_price,last_price,category,url FROM items ORDER BY id DESC LIMIT 50"
             )
-            rows = c.fetchall()
-    finally:
-        conn.close()
+            rows = sqlite_fetchall(cur2)
+        finally:
+            conn.close()
 
     if not rows:
         await update.message.reply_text("Ro‘yxat bo‘sh. /add bilan qo‘shing.")
@@ -617,21 +697,39 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = re.match(r"^home:list:(.+)$", data)
     if m:
         cat = m.group(1).strip().upper()
-        conn = db()
-        try:
-            with conn.cursor() as c:
+
+        if using_postgres():
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+            try:
+                with conn.cursor() as c:
+                    if cat == "ALL":
+                        c.execute(
+                            "SELECT id,title,currency,target_price,sell_price,last_price,category FROM items ORDER BY id DESC LIMIT 15"
+                        )
+                    else:
+                        c.execute(
+                            "SELECT id,title,currency,target_price,sell_price,last_price,category FROM items WHERE category=%s ORDER BY id DESC LIMIT 15",
+                            (cat,),
+                        )
+                    rows = c.fetchall()
+            finally:
+                conn.close()
+        else:
+            conn = sqlite3.connect(SQLITE_PATH)
+            try:
+                cur2 = conn.cursor()
                 if cat == "ALL":
-                    c.execute(
+                    cur2.execute(
                         "SELECT id,title,currency,target_price,sell_price,last_price,category FROM items ORDER BY id DESC LIMIT 15"
                     )
                 else:
-                    c.execute(
-                        "SELECT id,title,currency,target_price,sell_price,last_price,category FROM items WHERE category=%s ORDER BY id DESC LIMIT 15",
+                    cur2.execute(
+                        "SELECT id,title,currency,target_price,sell_price,last_price,category FROM items WHERE category=? ORDER BY id DESC LIMIT 15",
                         (cat,),
                     )
-                rows = c.fetchall()
-        finally:
-            conn.close()
+                rows = sqlite_fetchall(cur2)
+            finally:
+                conn.close()
 
         if not rows:
             await q.edit_message_text(f"Bo‘sh: {cat}. /add bilan qo‘shing.")
@@ -670,14 +768,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "del":
-        conn = db()
-        try:
-            with conn.cursor() as c:
-                c.execute("DELETE FROM items WHERE id=%s", (iid,))
-                deleted = c.rowcount
-            conn.commit()
-        finally:
-            conn.close()
+        if using_postgres():
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+            try:
+                with conn.cursor() as c:
+                    c.execute("DELETE FROM items WHERE id=%s", (iid,))
+                    deleted = c.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = sqlite3.connect(SQLITE_PATH)
+            try:
+                cur2 = conn.cursor()
+                cur2.execute("DELETE FROM items WHERE id=?", (iid,))
+                deleted = cur2.rowcount
+                conn.commit()
+            finally:
+                conn.close()
+
         await q.message.reply_text("🗑 O‘chirildi." if deleted else "Topilmadi.")
         return
 
@@ -687,19 +796,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "recalc":
-        conn = db()
-        try:
-            with conn.cursor() as c:
-                c.execute("SELECT last_price FROM items WHERE id=%s", (iid,))
-                row = c.fetchone()
+        if using_postgres():
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+            try:
+                with conn.cursor() as c:
+                    c.execute("SELECT last_price FROM items WHERE id=%s", (iid,))
+                    row = pg_fetchone(c)
+                    if not row:
+                        await q.message.reply_text("Topilmadi.")
+                        return
+                    new_sell = calc_sell_price(row["last_price"])
+                    c.execute("UPDATE items SET sell_price=%s WHERE id=%s", (new_sell, iid))
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = sqlite3.connect(SQLITE_PATH)
+            try:
+                cur2 = conn.cursor()
+                cur2.execute("SELECT last_price FROM items WHERE id=?", (iid,))
+                row = sqlite_fetchone(cur2)
                 if not row:
                     await q.message.reply_text("Topilmadi.")
                     return
                 new_sell = calc_sell_price(row["last_price"])
-                c.execute("UPDATE items SET sell_price=%s WHERE id=%s", (new_sell, iid))
-            conn.commit()
-        finally:
-            conn.close()
+                cur2.execute("UPDATE items SET sell_price=? WHERE id=?", (new_sell, iid))
+                conn.commit()
+            finally:
+                conn.close()
+
         await q.message.reply_text(f"♻️ #{iid} SELL qayta hisoblandi: {fmt_money(new_sell)} SAR")
         return
 
@@ -725,13 +850,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Narx xato. Masalan: 160 yoki 160.5")
             return
 
-        conn = db()
-        try:
-            with conn.cursor() as c:
-                c.execute("UPDATE items SET sell_price=%s WHERE id=%s", (new_sell, iid))
-            conn.commit()
-        finally:
-            conn.close()
+        if using_postgres():
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+            try:
+                with conn.cursor() as c:
+                    c.execute("UPDATE items SET sell_price=%s WHERE id=%s", (new_sell, iid))
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = sqlite3.connect(SQLITE_PATH)
+            try:
+                cur2 = conn.cursor()
+                cur2.execute("UPDATE items SET sell_price=? WHERE id=?", (new_sell, iid))
+                conn.commit()
+            finally:
+                conn.close()
 
         context.user_data.pop("edit_item_id", None)
         await update.message.reply_text(f"✅ #{iid} SELL yangilandi: {fmt_money(new_sell)} SAR")
@@ -741,13 +875,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if iid_cat:
         cat = (update.message.text or "").strip().upper()[:24]
 
-        conn = db()
-        try:
-            with conn.cursor() as c:
-                c.execute("UPDATE items SET category=%s WHERE id=%s", (cat, iid_cat))
-            conn.commit()
-        finally:
-            conn.close()
+        if using_postgres():
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+            try:
+                with conn.cursor() as c:
+                    c.execute("UPDATE items SET category=%s WHERE id=%s", (cat, iid_cat))
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = sqlite3.connect(SQLITE_PATH)
+            try:
+                cur2 = conn.cursor()
+                cur2.execute("UPDATE items SET category=? WHERE id=?", (cat, iid_cat))
+                conn.commit()
+            finally:
+                conn.close()
 
         context.user_data.pop("edit_cat_item_id", None)
         await update.message.reply_text(f"✅ #{iid_cat} kategoriya yangilandi: {cat}")
@@ -758,29 +901,40 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CHECK + POST
 # ======================
 async def post_item_to_channel(app: Application, item_id: int, forced: bool, notify_admin_chat: Optional[int] = None):
-    conn = db()
-    try:
-        with conn.cursor() as c:
-            c.execute(
-                "SELECT id,title,currency,target_price,sell_price,category,last_price,url,image_url FROM items WHERE id=%s",
+    if using_postgres():
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as c:
+                c.execute(
+                    "SELECT id,title,currency,target_price,sell_price,category,last_price,url,image_url FROM items WHERE id=%s",
+                    (item_id,),
+                )
+                row = pg_fetchone(c)
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(SQLITE_PATH)
+        try:
+            cur2 = conn.cursor()
+            cur2.execute(
+                "SELECT id,title,currency,target_price,sell_price,category,last_price,url,image_url FROM items WHERE id=?",
                 (item_id,),
             )
-            row = c.fetchone()
-    finally:
-        conn.close()
+            row = sqlite_fetchone(cur2)
+        finally:
+            conn.close()
 
     if not row:
         if notify_admin_chat:
             await app.bot.send_message(chat_id=notify_admin_chat, text="Topilmadi.")
         return
 
-    lp = row["last_price"]
-
-    if not forced and lp is not None:
-        pct = discount_pct(row["target_price"], lp)
-        if not (lp <= row["target_price"] or pct >= MIN_DISCOUNT_PCT):
+    if not forced and row["last_price"] is not None:
+        pct = discount_pct(row["target_price"], row["last_price"])
+        if not (row["last_price"] <= row["target_price"] or pct >= MIN_DISCOUNT_PCT):
             return
 
+    lp = row["last_price"]
     await send_deal_message(
         app=app,
         chat_id=CHANNEL_ID,
@@ -797,21 +951,38 @@ async def post_item_to_channel(app: Application, item_id: int, forced: bool, not
 
 
 async def run_check(app: Application, only_item_id: Optional[int], manual_chat_id: Optional[int] = None):
-    conn = db()
-    try:
-        with conn.cursor() as c:
+    if using_postgres():
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as c:
+                if only_item_id is None:
+                    c.execute(
+                        "SELECT id,url,title,currency,target_price,sell_price,category,last_price,last_alert_price,image_url FROM items"
+                    )
+                else:
+                    c.execute(
+                        "SELECT id,url,title,currency,target_price,sell_price,category,last_price,last_alert_price,image_url FROM items WHERE id=%s",
+                        (only_item_id,),
+                    )
+                rows = c.fetchall()
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(SQLITE_PATH)
+        try:
+            cur2 = conn.cursor()
             if only_item_id is None:
-                c.execute(
+                cur2.execute(
                     "SELECT id,url,title,currency,target_price,sell_price,category,last_price,last_alert_price,image_url FROM items"
                 )
             else:
-                c.execute(
-                    "SELECT id,url,title,currency,target_price,sell_price,category,last_price,last_alert_price,image_url FROM items WHERE id=%s",
+                cur2.execute(
+                    "SELECT id,url,title,currency,target_price,sell_price,category,last_price,last_alert_price,image_url FROM items WHERE id=?",
                     (only_item_id,),
                 )
-            rows = c.fetchall()
-    finally:
-        conn.close()
+            rows = sqlite_fetchall(cur2)
+        finally:
+            conn.close()
 
     if not rows:
         if manual_chat_id:
@@ -824,7 +995,7 @@ async def run_check(app: Application, only_item_id: Optional[int], manual_chat_i
             url = r["url"]
             title = r["title"]
             cur = r["currency"] or "SAR"
-            tp = r["target_price"]
+            tp = float(r["target_price"])
             sp = r["sell_price"]
             cat = r["category"]
             prev_price = r["last_price"]
@@ -852,20 +1023,36 @@ async def run_check(app: Application, only_item_id: Optional[int], manual_chat_i
             now_ts = int(time.time())
 
             # update db
-            conn2 = db()
-            try:
-                with conn2.cursor() as c2:
-                    c2.execute(
+            if using_postgres():
+                conn2 = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+                try:
+                    with conn2.cursor() as c2:
+                        c2.execute(
+                            """
+                            UPDATE items
+                            SET title=%s, currency=%s, last_price=%s, last_seen_ts=%s, image_url=%s, sell_price=%s
+                            WHERE id=%s
+                            """,
+                            (title, cur, now_price, now_ts, stored_img, sp, iid),
+                        )
+                    conn2.commit()
+                finally:
+                    conn2.close()
+            else:
+                conn2 = sqlite3.connect(SQLITE_PATH)
+                try:
+                    cur2 = conn2.cursor()
+                    cur2.execute(
                         """
                         UPDATE items
-                        SET title=%s, currency=%s, last_price=%s, last_seen_ts=%s, image_url=%s, sell_price=%s
-                        WHERE id=%s
+                        SET title=?, currency=?, last_price=?, last_seen_ts=?, image_url=?, sell_price=?
+                        WHERE id=?
                         """,
                         (title, cur, now_price, now_ts, stored_img, sp, iid),
                     )
-                conn2.commit()
-            finally:
-                conn2.close()
+                    conn2.commit()
+                finally:
+                    conn2.close()
 
             if now_price is None:
                 continue
@@ -873,7 +1060,7 @@ async def run_check(app: Application, only_item_id: Optional[int], manual_chat_i
             pct = discount_pct(tp, now_price)
             should_alert = (now_price <= tp) or (pct >= MIN_DISCOUNT_PCT)
 
-            if should_alert and (last_alert_price is None or abs(last_alert_price - now_price) > 0.01):
+            if should_alert and (last_alert_price is None or abs(float(last_alert_price) - now_price) > 0.01):
                 # DM admin
                 if ADMIN_ID:
                     await send_deal_message(
@@ -908,28 +1095,30 @@ async def run_check(app: Application, only_item_id: Optional[int], manual_chat_i
                     )
 
                 # save last_alert_price
-                conn3 = db()
-                try:
-                    with conn3.cursor() as c3:
-                        c3.execute("UPDATE items SET last_alert_price=%s WHERE id=%s", (now_price, iid))
-                    conn3.commit()
-                finally:
-                    conn3.close()
+                if using_postgres():
+                    conn3 = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+                    try:
+                        with conn3.cursor() as c3:
+                            c3.execute("UPDATE items SET last_alert_price=%s WHERE id=%s", (now_price, iid))
+                        conn3.commit()
+                    finally:
+                        conn3.close()
+                else:
+                    conn3 = sqlite3.connect(SQLITE_PATH)
+                    try:
+                        cur3 = conn3.cursor()
+                        cur3.execute("UPDATE items SET last_alert_price=? WHERE id=?", (now_price, iid))
+                        conn3.commit()
+                    finally:
+                        conn3.close()
 
 
-async def scheduler_loop(app: Application):
-    while True:
-        try:
-            await run_check(app, only_item_id=None)
-        except Exception as e:
-            # xohlasangiz log qilamiz:
-            print(f"[scheduler] error: {e}")
-        await asyncio.sleep(CHECK_EVERY_SEC)
-
-
-def start_scheduler_job(context):
-    # JobQueue callback sync bo‘lishi mumkin, shuning uchun task qilib yuboramiz
-    context.application.create_task(scheduler_loop(context.application))
+async def job_check(context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    try:
+        await run_check(app, only_item_id=None)
+    except Exception:
+        pass
 
 
 # ======================
@@ -953,10 +1142,10 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # background scheduler (ishonchli start)
-    app.job_queue.run_once(start_scheduler_job, when=1)
+    # scheduler: every CHECK_EVERY_SEC
+    app.job_queue.run_repeating(job_check, interval=CHECK_EVERY_SEC, first=3)
 
-    print("✅ Deal Watcher Admin Bot (PostgreSQL) running…")
+    print(f"✅ Deal Watcher Admin Bot running… DB={db_kind()} CHECK_EVERY_SEC={CHECK_EVERY_SEC}")
     app.run_polling(drop_pending_updates=True)
 
 
