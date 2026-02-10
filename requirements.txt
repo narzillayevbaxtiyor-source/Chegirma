@@ -2,3 +2,4 @@ python-telegram-bot==21.6
 aiohttp==3.9.5
 beautifulsoup4==4.12.3
 certifi
+psycopg2-binary==2.9.9
