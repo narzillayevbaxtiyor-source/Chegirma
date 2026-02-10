@@ -3,7 +3,7 @@ import re
 import json
 import time
 import asyncio
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Union
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -11,11 +11,7 @@ from bs4 import BeautifulSoup
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -31,18 +27,18 @@ from telegram.ext import (
 # ======================
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 ADMIN_ID = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
-CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()
+CHANNEL_ID_RAW = (os.getenv("CHANNEL_ID") or "").strip()
 
 CHECK_EVERY_SEC = int(os.getenv("CHECK_EVERY_SEC") or "900")          # 15 min
 MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT") or "25")
 AUTO_POST_TO_CHANNEL = (os.getenv("AUTO_POST_TO_CHANNEL") or "0").strip() == "1"
 
-SELL_MARKUP = float(os.getenv("SELL_MARKUP") or "1.35")               # +35%
-SELL_ADD = float(os.getenv("SELL_ADD") or "0")                        # SAR
+SELL_MARKUP = float(os.getenv("SELL_MARKUP") or "1.35")              # +35%
+SELL_ADD = float(os.getenv("SELL_ADD") or "0")                       # SAR
 SELL_ROUND = float(os.getenv("SELL_ROUND") or "1")
 AUTO_UPDATE_SELL_ON_ALERT = (os.getenv("AUTO_UPDATE_SELL_ON_ALERT") or "1").strip() == "1"
 
-SAR_PER_USD = float(os.getenv("SAR_PER_USD") or "3.70")               # 1$=3.70 SAR
+SAR_PER_USD = float(os.getenv("SAR_PER_USD") or "3.70")              # 1$=3.70 SAR
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
@@ -55,13 +51,34 @@ UA = os.getenv(
 ).strip()
 
 
+def parse_chat_id(v: str) -> Optional[Union[int, str]]:
+    """
+    CHANNEL_ID:
+      - "-100123..." bo‘lsa int qilib olamiz
+      - "@channelusername" bo‘lsa string qoldiramiz
+      - bo‘sh bo‘lsa None
+    """
+    v = (v or "").strip()
+    if not v:
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        try:
+            return int(v)
+        except:
+            return v
+    return v
+
+
+CHANNEL_ID = parse_chat_id(CHANNEL_ID_RAW)
+
 # ======================
 # DB (PostgreSQL)
 # ======================
 def db():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL yo‘q. Railway’da PostgreSQL qo‘shing.")
+        raise RuntimeError("DATABASE_URL yo‘q. Railway’da PostgreSQL qo‘shing va Chegirma servisiga DATABASE_URL reference qiling.")
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
 
 def init_db():
     conn = db()
@@ -97,11 +114,13 @@ def is_admin(update: Update) -> bool:
     u = update.effective_user
     return bool(u and (ADMIN_ID == 0 or u.id == ADMIN_ID))
 
+
 def fmt_money(x: Optional[float]) -> str:
     if x is None:
         return "—"
     s = f"{x:.2f}".rstrip("0").rstrip(".")
     return s
+
 
 def clean_price(s: str) -> Optional[float]:
     if not s:
@@ -116,21 +135,25 @@ def clean_price(s: str) -> Optional[float]:
     except:
         return None
 
-def discount_pct(base: float, now: float) -> float:
-    if base <= 0:
+
+def discount_pct(base: Optional[float], now: Optional[float]) -> float:
+    if base is None or now is None or base <= 0:
         return 0.0
     return max(0.0, (base - now) / base * 100.0)
+
 
 def round_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return round(x / step) * step
 
+
 def calc_sell_price(last_price: Optional[float]) -> Optional[float]:
     if last_price is None:
         return None
     raw = last_price * SELL_MARKUP + SELL_ADD
     return round_to_step(raw, SELL_ROUND)
+
 
 def sar_to_usd(sar: Optional[float]) -> Optional[float]:
     if sar is None:
@@ -153,6 +176,7 @@ def extract_json_ld(soup: BeautifulSoup) -> List[Dict[str, Any]]:
         except:
             continue
     return out
+
 
 def find_product_offer(data: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
     title = None
@@ -190,6 +214,7 @@ def find_product_offer(data: Dict[str, Any]) -> Tuple[Optional[float], Optional[
                     break
 
     return price, currency, title, image_url
+
 
 def parse_page(html: str) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
     soup = BeautifulSoup(html, "html.parser")
@@ -239,11 +264,14 @@ def parse_page(html: str) -> Tuple[Optional[float], Optional[str], Optional[str]
 # ======================
 async def fetch_html(session: aiohttp.ClientSession, url: str) -> str:
     headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,ar;q=0.8"}
+    timeout = aiohttp.ClientTimeout(total=25)
+
     if SCRAPER_API_KEY:
         proxied = f"{SCRAPER_API_ENDPOINT}?api_key={SCRAPER_API_KEY}&url={aiohttp.helpers.quote(url, safe='')}"
-        async with session.get(proxied, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as r:
+        async with session.get(proxied, headers=headers, timeout=timeout) as r:
             return await r.text()
-    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as r:
+
+    async with session.get(url, headers=headers, timeout=timeout) as r:
         return await r.text()
 
 
@@ -260,13 +288,12 @@ def build_caption(
     sell_price: Optional[float],
     category: Optional[str],
 ) -> str:
-    now = last_price
-    pct = discount_pct(target_price, now) if (now is not None) else 0.0
+    pct = discount_pct(prev_price, last_price)
 
     cat_line = f"🏷 Kategoriya: <b>{category}</b>\n" if category else ""
 
     prev_usd = sar_to_usd(prev_price)
-    now_usd = sar_to_usd(now)
+    now_usd = sar_to_usd(last_price)
     target_usd = sar_to_usd(target_price)
     sell_usd = sar_to_usd(sell_price)
 
@@ -282,7 +309,7 @@ def build_caption(
         f"{cat_line}"
         f"📌 Avvalgi narxi: <b>{fmt_money(prev_price)} SAR</b>\n"
         f"   (${fmt_money(prev_usd)})\n"
-        f"✅ Hozirgi narxi: <b>{fmt_money(now)} SAR</b>\n"
+        f"✅ Hozirgi narxi: <b>{fmt_money(last_price)} SAR</b>\n"
         f"   (${fmt_money(now_usd)})\n"
         f"🎯 Trigger narx: <b>{fmt_money(target_price)} SAR</b>\n"
         f"   (${fmt_money(target_usd)})\n"
@@ -293,8 +320,10 @@ def build_caption(
         f"📩 Buyurtma uchun DM"
     ).strip()
 
+
 def deal_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Ko‘rish / Buyurtma", url=url)]])
+
 
 def home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -313,6 +342,7 @@ def home_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
 
 def panel_keyboard(item_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -338,7 +368,7 @@ def panel_keyboard(item_id: int) -> InlineKeyboardMarkup:
 # ======================
 async def send_deal_message(
     app: Application,
-    chat_id: str | int,
+    chat_id: Union[str, int],
     title: str,
     url: str,
     currency: str,
@@ -361,7 +391,7 @@ async def send_deal_message(
     )
     kb = deal_keyboard(url)
 
-    if image_url and image_url.startswith("http"):
+    if image_url and isinstance(image_url, str) and image_url.startswith("http"):
         try:
             await app.bot.send_photo(
                 chat_id=chat_id,
@@ -396,6 +426,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /add <url> <trigger_price> [sell_price] [category]\n"
         "• /panel\n"
         "• /item <id>\n"
+        "• /list\n"
         "• /checkall\n\n"
         "Misol:\n"
         "/add https://sa.iherb.com/... 120 160 VITAMIN\n"
@@ -405,10 +436,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
+
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
         return
     await update.message.reply_text("🧩 Admin panel:", reply_markup=home_keyboard())
+
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
@@ -489,12 +522,14 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
+
 async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
         return
     await update.message.reply_text("🔎 Hammasini tekshiryapman…")
     await run_check(context.application, only_item_id=None, manual_chat_id=update.effective_chat.id)
     await update.message.reply_text("✅ Tekshiruv tugadi.")
+
 
 async def cmd_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
@@ -539,6 +574,7 @@ async def cmd_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=panel_keyboard(iid),
         disable_web_page_preview=True,
     )
+
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not update.message:
@@ -738,12 +774,13 @@ async def post_item_to_channel(app: Application, item_id: int, forced: bool, not
             await app.bot.send_message(chat_id=notify_admin_chat, text="Topilmadi.")
         return
 
-    if not forced and row["last_price"] is not None:
-        pct = discount_pct(row["target_price"], row["last_price"])
-        if not (row["last_price"] <= row["target_price"] or pct >= MIN_DISCOUNT_PCT):
+    lp = row["last_price"]
+
+    if not forced and lp is not None:
+        pct = discount_pct(row["target_price"], lp)
+        if not (lp <= row["target_price"] or pct >= MIN_DISCOUNT_PCT):
             return
 
-    lp = row["last_price"]
     await send_deal_message(
         app=app,
         chat_id=CHANNEL_ID,
@@ -880,13 +917,19 @@ async def run_check(app: Application, only_item_id: Optional[int], manual_chat_i
                     conn3.close()
 
 
-async def scheduler(app: Application):
+async def scheduler_loop(app: Application):
     while True:
         try:
             await run_check(app, only_item_id=None)
-        except Exception:
-            pass
+        except Exception as e:
+            # xohlasangiz log qilamiz:
+            print(f"[scheduler] error: {e}")
         await asyncio.sleep(CHECK_EVERY_SEC)
+
+
+def start_scheduler_job(context):
+    # JobQueue callback sync bo‘lishi mumkin, shuning uchun task qilib yuboramiz
+    context.application.create_task(scheduler_loop(context.application))
 
 
 # ======================
@@ -910,8 +953,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # background scheduler
-    app.job_queue.run_once(lambda *_: asyncio.create_task(scheduler(app)), when=1)
+    # background scheduler (ishonchli start)
+    app.job_queue.run_once(start_scheduler_job, when=1)
 
     print("✅ Deal Watcher Admin Bot (PostgreSQL) running…")
     app.run_polling(drop_pending_updates=True)
